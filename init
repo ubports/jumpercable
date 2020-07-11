@@ -1,0 +1,303 @@
+#!/bin/sh
+
+# Copyright (C) 2020 UBports Foundation
+#
+# jumpercable is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# jumpercable is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with jumpercable.  If not, see <http://www.gnu.org/licenses/>.
+
+process_bind_mounts() {
+	# Goes over /etc/system-image/writable-paths to create the correct fstab for
+	# the bind-mounts. Writes them into /run/image.fstab which is
+	# bind-mounted to /etc/fstab
+
+	if [ ! -e /etc/system-image/writable-paths ]; then
+		echo "This rootfs does not have any writable-paths defined"
+		return 0
+	fi
+
+	# Prepare the fstab
+	FSTAB=/etc/fstab
+	touch /run/image.fstab
+	mount -o bind /run/image.fstab $FSTAB ||halium_panic "Could not bind-mount fstab"
+	echo "/dev/root / rootfs defaults,ro 0 0" >>$FSTAB
+
+	echo "Adding bind-mounts to $FSTAB"
+	# Process the list of bind-mounts
+	# (but don't mount them, mountall will do it)
+	cat /etc/system-image/writable-paths | while read line; do
+		set -- $line
+		# Skip invalid/commented entries
+		([ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ] || [ -z "$5" ]) && continue
+		[ "$1" = "#" ] && continue
+
+		# Skip invalid mount points
+		dstpath="/$1"
+		[ ! -e "$dstpath" ] && continue
+
+		if [ "$3" = "temporary" ]; then
+			# Temporary entries are simple, just mount a tmpfs
+			echo "tmpfs $1 tmpfs $5 0 0" >>$FSTAB
+		elif [ "$3" = "persistent" ] || [ "$3" = "synced" ]; then
+			# Figure out the source path
+			if [ "$2" = "auto" ]; then
+				srcpath="/userdata/system-data/$1"
+				path="/userdata/system-data/$1"
+			else
+				srcpath="/userdata/$2"
+				path="/userdata/$2"
+			fi
+
+			if [ ! -e "$srcpath" ]; then
+				# Process new persistent or synced paths
+				dstown=$(stat -c "%u:%g" $dstpath)
+				dstmode=$(stat -c "%a" $dstpath)
+				mkdir -p ${srcpath%/*}
+				if [ ! -d "$dstpath" ]; then
+					# Deal with redirected files
+					if [ "$4" = "transition" ]; then
+						cp -a $dstpath $srcpath
+					else
+						touch $srcpath
+						chown $dstown $srcpath
+						chmod $dstmode $srcpath
+					fi
+				else
+					# Deal with redirected directories
+					if [ "$4" = "transition" ] || [ "$3" = "synced" ]; then
+						cp -aR $dstpath $srcpath
+					else
+						mkdir $srcpath
+						chown $dstown $srcpath
+						chmod $dstmode $srcpath
+					fi
+				fi
+			elif [ "$3" = "synced" ]; then
+				# Process existing synced paths
+				sync_dirs $dstpath . $srcpath
+			fi
+
+			# Write the fstab entry
+			if [ "$5" = "none" ]; then
+				echo "$path $1 none bind 0 0" >>$FSTAB
+			else
+				echo "$path $1 none bind,$5 0 0" >>$FSTAB
+			fi
+		else
+			continue
+		fi
+	done
+}
+
+mount_android_partitions() {
+	fstab=$1
+	mount_root=$2
+	real_userdata=$3
+
+	echo "checking fstab $fstab for additional mount points"
+
+	# On systems with A/B partition layout, current slot is provided via cmdline parameter.
+	ab_slot_suffix=$(grep -o 'androidboot\.slot_suffix=..' /proc/cmdline |  cut -d "=" -f2)
+	[ ! -z "$ab_slot_suffix" ] && echo "A/B slot system detected! Slot suffix is $ab_slot_suffix"
+
+	cat ${fstab} | while read line; do
+		set -- $line
+
+		# stop processing if we hit the "#endhalium" comment in the file
+		echo $1 | egrep -q "^#endhalium" && break
+
+		# Skip any unwanted entry
+		echo $1 | egrep -q "^#" && continue
+		([ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ]) && continue
+		([ "$2" = "/system" ] || [ "$2" = "/data" ] || [ "$2" = "/" ]) && continue
+
+		label=$(echo $1 | awk -F/ '{print $NF}')
+		[ -z "$label" ] && continue
+
+		echo "checking mount label $label"
+
+		# In case fstab provides /dev/mmcblk0p* lines
+		path="/dev/$label"
+		for dir in by-partlabel by-name by-label by-path by-uuid by-partuuid by-id; do
+			# On A/B systems not all of the partitions are duplicated, so we have to check with and without suffix
+			if [ -e "/dev/disk/$dir/$label$ab_slot_suffix" ]; then
+				path="/dev/disk/$dir/$label$ab_slot_suffix"
+				break
+			elif [ -e "/dev/disk/$dir/$label" ]; then
+				path="/dev/disk/$dir/$label"
+				break
+			fi
+		done
+
+		[ ! -e "$path" ] && continue
+
+		mkdir -p ${mount_root}/$2
+		echo "mounting $path as ${mount_root}/$2"
+		mount $path ${mount_root}/$2 -t $3 -o $4
+	done
+
+	# Provide a bind mount from /cache to /userdata/cache on systems without a dedicated cache partition
+	if [ ! -e ${mount_root}/cache ]; then
+		if [ ! -d ${real_userdata}/cache ]; then
+			mkdir ${real_userdata}/cache
+		fi
+		mkdir ${mount_root}/cache
+		mount -o bind ${real_userdata}/cache ${mount_root}/cache
+	fi
+
+	# Create an appropriate symlink for vendor files
+	if [ ! -e ${mount_root}/vendor ]; then
+		ln -sf system/vendor ${mount_root}/vendor
+	fi
+}
+
+mount_halium_overlay() {
+	source=$1
+	target=$2
+
+	if [ -d ${source} ]; then
+		OLD_PWD=$PWD
+		cd ${source}
+
+		for overlay in $(find . -type f); do
+			[ -f ${target}/${overlay} ] && mount --bind ${source}/${overlay} ${target}/${overlay}
+		done
+
+		cd $OLD_PWD
+	fi
+}
+
+mount_userdata() {
+	partlist="userdata UDA DATAFS USERDATA"
+
+	# find the right partition
+	for partname in $partlist; do
+		part=$(find /dev -name $partname | tail -1)
+		[ -z "$part" ] && continue
+		path=$(readlink -f $part)
+		[ -n "$path" ] && break
+	done
+
+	# override with a possible cmdline parameter
+	if grep -q datapart= /proc/cmdline; then
+		for x in $(cat /proc/cmdline); do
+			case ${x} in
+			datapart=*)
+				path=${x#*=}
+				;;
+			esac
+		done
+	fi
+
+	if [ -z "$path" ]; then
+		echo "Couldn't find data partition."
+	fi
+
+	echo "checking filesystem integrity for the userdata partition"
+	# Mounting and umounting first, let the kernel handle the journal and
+	# orphaned inodes (faster than e2fsck). Then, just run e2fsck forcing -y.
+	# Also check the amount of time used by to check the filesystem.
+	fsck_start=$(date +%s)
+	mount -o errors=remount-ro $path /userdata
+	umount /userdata
+	e2fsck -y $path >/run/e2fsck.out 2>&1
+	fsck_end=$(date +%s)
+	echo "checking filesystem for userdata took (including e2fsck) $((fsck_end - fsck_start)) seconds"
+
+	# Mount the data partition to a temporary mount point
+	# FIXME: data=journal used on ext4 as a workaround for bug 1387214
+	[ `blkid $path -o value -s TYPE` = "ext4" ] && OPTIONS="data=journal,"
+	mount -o discard,$OPTIONS $path /userdata
+}
+
+mount_android_rootfs() {
+	mount -o loop /var/lib/lxc/android/android-rootfs.img /var/lib/lxc/android/rootfs
+	mount -o bind /var/lib/lxc/android/rootfs /android
+	mount -o bind /mnt /var/lib/lxc/android/rootfs/mnt
+}
+
+set_halium_version_properties() {
+	halium_system=$1
+	android_data=$2
+
+	channel_ini=$1/etc/system-image/channel.ini
+	def_language=$1/custom/default_language
+
+	halium="unknown"
+	device="unknown"
+	custom="unknown"
+	version="unknown"
+	channel="unknown"
+	def_lang="unknown"
+
+	if [ -f "$channel_ini" ]; then
+		IFS=','
+		for i in $(grep version_detail $channel_ini | awk -F ' ' '{print $2}'); do
+			id=${i%=*}
+			case $id in
+			halium) halium=${i#halium=} ;;
+			device) device=${i#device=} ;;
+			custom) custom=${i#custom=} ;;
+			version) version=${i#version=} ;;
+			esac
+		done
+		unset IFS
+		channel=$(grep channel $channel_ini | awk -F ' ' '{print $2}')
+	fi
+
+	if [ -f "$def_language" ]; then
+		lang=$(cat $def_language)
+		if [ -n "$lang" ]; then
+			def_lang=$lang
+		fi
+	fi
+
+	# Write down so the android property system can load them automatically
+	mkdir -p $android_data/property
+	chmod 700 $android_data/property
+	echo -n "$halium" >$android_data/property/persist.halium.version.rootfs
+	echo -n "$device" >$android_data/property/persist.halium.version.device
+	echo -n "$custom" >$android_data/property/persist.halium.version.custom
+	echo -n "$channel" >$android_data/property/persist.halium.version.channel
+	echo -n "$version" >$android_data/property/persist.halium.version
+	echo -n "$def_lang" >$android_data/property/persist.halium.default_language
+	chmod 600 $android_data/property/persist.halium*
+}
+
+export PATH=/bin:/usr/bin:/sbin:/usr/sbin
+
+# Put all of this script's output into /dev/kmsg
+exec &>/dev/kmsg
+
+# Mount a tmpfs in /run of rootfs to put the future image.fstab
+mount -o rw,nosuid,noexec,relatime,mode=755 -t tmpfs tmpfs /run
+mount -t devtmpfs devtmpfs /dev
+mkdir /dev/pts
+mount -t devpts -o noexec,nosuid,gid=5,mode=0620 devpts /dev/pts || true
+mount -t sysfs none /sys
+mount -t proc none /proc
+
+udevadm trigger --type=subsystems --action=add
+udevadm settle
+udevadm trigger --type=devices --action=add
+udevadm settle
+udevadm trigger --action=add
+udevadm settle
+
+mount_android_rootfs
+mount_userdata
+mount_android_partitions "/var/lib/lxc/android/rootfs/fstab*" /android /userdata
+set_halium_version_properties / /userdata/android-data
+process_bind_mounts
+mount_halium_overlay /android/system/halium /
+
+exec /sbin/init
