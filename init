@@ -286,13 +286,6 @@ mount -t devpts -o noexec,nosuid,gid=5,mode=0620 devpts /dev/pts || true
 mount -t sysfs none /sys
 mount -t proc none /proc
 
-udevadm trigger --type=subsystems --action=add
-udevadm settle
-udevadm trigger --type=devices --action=add
-udevadm settle
-udevadm trigger --action=add
-udevadm settle
-
 mount_android_rootfs
 mount_userdata
 mount_android_partitions "/var/lib/lxc/android/rootfs/fstab*" /android /userdata
