@@ -286,6 +286,10 @@ mount -t devpts -o noexec,nosuid,gid=5,mode=0620 devpts /dev/pts || true
 mount -t sysfs none /sys
 mount -t proc none /proc
 
+# Distinguish between halium-boot & jumpercable boot process
+touch /dev/.halium_jumpercable
+chmod 000 /dev/.halium_jumpercable
+
 mount_android_rootfs
 mount_userdata
 mount_android_partitions "/var/lib/lxc/android/rootfs/fstab*" /android /userdata
