@@ -1,0 +1,6 @@
+debian/debhelper-build-stamp
+debian/files
+debian/jumpercable
+debian/jumpercable.debhelper.log
+debian/jumpercable.substvars
+debian/tmp
