@@ -1,0 +1,12 @@
+Source: jumpercable
+Section: misc
+Priority: optional
+Maintainer: Alfred Neumayer <dev.beidl@gmail.com>
+Build-Depends: debhelper (>= 8.1.3)
+Standards-Version: 3.8.4
+
+Package: jumpercable
+Section: misc
+Architecture: all
+Depends: bash, ${shlibs:Depends}, ${misc:Depends}
+Description: Boot environment helper for System-As-Root devices

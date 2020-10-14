@@ -1,0 +1,8 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+
+override_dh_auto_install:
+	install -o 0 -g 0 -m 0755 -D -T init debian/tmp/init
+
+%:
+	dh $@
