@@ -235,8 +235,6 @@ mount_userdata() {
 
 mount_android_rootfs() {
 	mount -o loop /var/lib/lxc/android/android-rootfs.img /var/lib/lxc/android/rootfs
-	mount -o bind /var/lib/lxc/android/rootfs /android
-	mount -o bind /mnt /var/lib/lxc/android/rootfs/mnt
 }
 
 set_halium_version_properties() {
@@ -294,19 +292,41 @@ if [ ! -e /proc/self/exe ]; then
 	# Put all of this script's output into /dev/kmsg
 	exec &>/dev/kmsg
 
+	# Mount proc early on for charging mode check
+	mount -t proc none /proc
+
+	# Switch into the Android rootfs for charging if requested
+	for x in $(cat /proc/cmdline); do
+		case ${x} in
+		androidboot.mode=*)
+			android_bootmode=${x#*=}
+			;;
+		esac
+	done
+
+	# No offline charging support for now, so just force a reboot
+	if [ "$android_bootmode" = "charger" ]; then
+		umount /proc
+		reboot -f
+	fi
+
 	# Mount a tmpfs in /run of rootfs to put the future image.fstab
 	mount -o rw,nosuid,noexec,relatime,mode=755 -t tmpfs tmpfs /run
 	mount -t devtmpfs devtmpfs /dev
 	mkdir /dev/pts
 	mount -t devpts -o noexec,nosuid,gid=5,mode=0620 devpts /dev/pts || true
 	mount -t sysfs none /sys
-	mount -t proc none /proc
 
 	# Distinguish between halium-boot & jumpercable boot process
 	touch /dev/.halium_jumpercable
 	chmod 000 /dev/.halium_jumpercable
 
 	mount_android_rootfs
+
+	# Bind mount rootfs to /android
+	mount -o bind /var/lib/lxc/android/rootfs /android
+	mount -o bind /mnt /var/lib/lxc/android/rootfs/mnt
+
 	mount_userdata
 	mount_android_partitions "/var/lib/lxc/android/rootfs/fstab*" /android /userdata
 	set_halium_version_properties / /userdata/android-data
@@ -315,4 +335,4 @@ if [ ! -e /proc/self/exe ]; then
 fi
 
 # Execute actual init now
-exec /sbin/init
+exec /sbin/init $@
